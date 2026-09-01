@@ -103,12 +103,12 @@ def export_controller(
     """Capture two identical controller passes and export the node as PT2."""
     # Construct outside leapp.start(): model construction calls scalar Warp
     # built-ins that are unrelated to the exported tensor computation.
-    controllers = [make_controller(device) for _ in range(2)]
+    controller = make_controller(device)
 
     leapp.start(name=GRAPH_NAME, save_path=str(output_root))
     try:
         # LEAPP requires two executions: discovery first, then APIC capture.
-        for controller in controllers:
+        for _ in range(2):
             # Use fresh controller to prevent mixed buffer issues
             source_arrays = {
                 name: wp.array(value, dtype=wp.float32, device=device)
