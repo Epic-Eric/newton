@@ -139,7 +139,7 @@ def export_controller(
     leapp.compile_graph(
         visualize=False,
         validate=True,
-        atol=1.0e-4,
+        atol=1.0e-5,
         strict=True,
     )
     return output_root / GRAPH_NAME / f"{GRAPH_NAME}.yaml"
@@ -182,7 +182,7 @@ class TestLeappExport(unittest.TestCase):
         np.testing.assert_allclose(
             exported_joint_f,
             native_joint_f,
-            atol=1.0e-4,
+            atol=1.0e-5,
         )
 
         print(f"Native Newton joint_f: {native_joint_f}")
