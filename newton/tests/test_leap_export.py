@@ -109,10 +109,7 @@ def export_controller(
     try:
         # LEAPP requires two executions: discovery first, then APIC capture.
         for controller in controllers:
-            # Use fresh controller and boundary objects on each pass. LEAPP
-            # promotes Warp arrays to traced subclasses in place; rebuilding
-            # also prevents persistent first-pass controller buffers from
-            # retaining first-pass FX proxies during APIC capture.
+            # Use fresh controller to prevent mixed buffer issues
             source_arrays = {
                 name: wp.array(value, dtype=wp.float32, device=device)
                 for name, value in source_values.items()
