@@ -24,8 +24,8 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton.actuators import ControllerPD, ControllerPID
-from newton.controllers import ControllerJointImpedance, ControllerJointImpedanceModelFree
+from newton.actuators import DrivePD, DrivePID
+from newton.controllers import ControllerJointImpedance, ControllerJointImpedanceModelFree, ControllerOperationalSpace
 
 try:
     import leapp
@@ -50,7 +50,11 @@ def _f32(values) -> np.ndarray:
 
 
 def _warp_arrays(values: SourceValues, device: wp.DeviceLike) -> dict[str, wp.array[Any]]:
-    return {name: wp.array(value, dtype=wp.float32, device=device) for name, value in values.items()}
+    dtypes = {
+        "desired_tool_pose_operational": wp.transform,
+        "desired_twist_operational": wp.spatial_vector,
+    }
+    return {name: wp.array(value, dtype=dtypes.get(name, wp.float32), device=device) for name, value in values.items()}
 
 
 def _annotate_inputs(node_name: str, arrays: dict[str, wp.array[Any]]) -> dict[str, wp.array[Any]]:
@@ -81,7 +85,16 @@ def _actuator_values(positions, velocities, target_pos, target_vel, feedforward)
     }
 
 
-def _build_arm(device: wp.DeviceLike, link_count: int = 2) -> newton.Model:
+def _operational_values(q, qd, desired_pose, desired_twist) -> SourceValues:
+    return {
+        "joint_q": _f32(q),
+        "joint_qd": _f32(qd),
+        "desired_tool_pose_operational": _f32([desired_pose]),
+        "desired_twist_operational": _f32([desired_twist]),
+    }
+
+
+def _build_arm(device: wp.DeviceLike, link_count: int = 2, *, add_tool_site: bool = False) -> newton.Model:
     builder = newton.ModelBuilder()
     inertia = wp.mat33(np.diag([0.02, 0.02, 0.02]).astype(np.float32))
     parent = -1
@@ -103,6 +116,12 @@ def _build_arm(device: wp.DeviceLike, link_count: int = 2) -> newton.Model:
         parent = link
 
     builder.add_articulation(list(range(link_count)), label="arm")
+    if add_tool_site:
+        builder.add_site(
+            parent,
+            xform=wp.transform(p=wp.vec3(0.5, 0.0, 0.0)),
+            label="tool_site",
+        )
     return builder.finalize(device=device)
 
 
@@ -194,31 +213,8 @@ class ControllerExportCase(ABC):
         return np.stack(outputs)
 
 
-class ModelBasedJointImpedanceCase(ControllerExportCase):
-    """Model-based controller with internally computed dynamics terms."""
-
-    node_name = "model_based_joint_impedance"
-
-    @property
-    def pass_values(self) -> SourceSequence:
-        return (
-            _joint_values([0.3, -0.4], [0.1, 0.2], [0.0, 0.5], [0.0, 0.0]),
-            _joint_values([-0.2, 0.6], [-0.3, 0.4], [0.7, -0.1], [0.2, -0.2]),
-        )
-
-    @property
-    def runtime_values(self) -> SourceSequence:
-        first = _joint_values([0.15, -0.25], [-0.05, 0.3], [0.4, 0.1], [0.1, -0.1])
-        middle = _joint_values([-0.45, 0.35], [0.25, -0.2], [-0.1, 0.6], [0.0, 0.25])
-        return (first, middle, first)
-
-    def make_controller(self) -> ControllerJointImpedance:
-        model = _build_arm(self.device)
-        return ControllerJointImpedance(
-            model,
-            stiffness=wp.array([50.0, 30.0], dtype=wp.float32, device=self.device),
-            damping=wp.array([5.0, 3.0], dtype=wp.float32, device=self.device),
-        )
+class StepControllerCase(ControllerExportCase):
+    """Shared input/output struct lifecycle for controllers exposing step()."""
 
     @staticmethod
     def _prepare_step(controller, arrays):
@@ -248,7 +244,84 @@ class ModelBasedJointImpedanceCase(ControllerExportCase):
         return np.stack(outputs)
 
 
-class ModelFreeJointImpedanceCase(ControllerExportCase):
+class ModelBasedJointImpedanceCase(StepControllerCase):
+    """Model-based controller with internally computed dynamics terms."""
+
+    node_name = "model_based_joint_impedance"
+
+    @property
+    def pass_values(self) -> SourceSequence:
+        return (
+            _joint_values([0.3, -0.4], [0.1, 0.2], [0.0, 0.5], [0.0, 0.0]),
+            _joint_values([-0.2, 0.6], [-0.3, 0.4], [0.7, -0.1], [0.2, -0.2]),
+        )
+
+    @property
+    def runtime_values(self) -> SourceSequence:
+        first = _joint_values([0.15, -0.25], [-0.05, 0.3], [0.4, 0.1], [0.1, -0.1])
+        middle = _joint_values([-0.45, 0.35], [0.25, -0.2], [-0.1, 0.6], [0.0, 0.25])
+        return (first, middle, first)
+
+    def make_controller(self) -> ControllerJointImpedance:
+        model = _build_arm(self.device)
+        return ControllerJointImpedance(
+            model,
+            stiffness=wp.array([50.0, 30.0], dtype=wp.float32, device=self.device),
+            damping=wp.array([5.0, 3.0], dtype=wp.float32, device=self.device),
+        )
+
+
+class OperationalSpaceCase(StepControllerCase):
+    """Model-based tool-pose and tool-twist control for a planar arm."""
+
+    node_name = "operational_space"
+
+    @property
+    def pass_values(self) -> SourceSequence:
+        return (
+            _operational_values(
+                [0.3, -0.4],
+                [0.1, 0.2],
+                [0.8, 0.3, 0.0, 0.0, 0.0, 0.149438, 0.988771],
+                [0.05, -0.1, 0.0, 0.0, 0.0, 0.2],
+            ),
+            _operational_values(
+                [-0.2, 0.6],
+                [-0.3, 0.4],
+                [0.6, -0.2, 0.0, 0.0, 0.0, -0.099833, 0.995004],
+                [-0.1, 0.15, 0.0, 0.0, 0.0, -0.1],
+            ),
+        )
+
+    @property
+    def runtime_values(self) -> SourceSequence:
+        first = _operational_values(
+            [0.15, -0.25],
+            [-0.05, 0.3],
+            [0.75, 0.15, 0.0, 0.0, 0.0, 0.124675, 0.992198],
+            [0.1, -0.05, 0.0, 0.0, 0.0, 0.15],
+        )
+        middle = _operational_values(
+            [-0.45, 0.35],
+            [0.25, -0.2],
+            [0.5, -0.25, 0.0, 0.0, 0.0, -0.174108, 0.984727],
+            [-0.15, 0.1, 0.0, 0.0, 0.0, -0.2],
+        )
+        return (first, middle, first)
+
+    def make_controller(self) -> ControllerOperationalSpace:
+        model = _build_arm(self.device, add_tool_site=True)
+        return ControllerOperationalSpace(
+            model,
+            tool_sites="tool_site",
+            motion_stiffness=wp.spatial_vector(40.0, 40.0, 0.0, 0.0, 0.0, 20.0),
+            motion_damping=wp.spatial_vector(4.0, 4.0, 0.0, 0.0, 0.0, 2.0),
+            use_inertia_decoupling=False,
+            use_gravity_compensation=False,
+        )
+
+
+class ModelFreeJointImpedanceCase(StepControllerCase):
     """Heterogeneous model-free controller with live gains and dynamics inputs."""
 
     node_name = "model_free_joint_impedance"
@@ -341,33 +414,6 @@ class ModelFreeJointImpedanceCase(ControllerExportCase):
             device=self.device,
         )
 
-    @staticmethod
-    def _prepare_step(controller, arrays):
-        inputs = controller.input()
-        outputs = controller.output()
-        for name, value in arrays.items():
-            setattr(inputs, name, value)
-        return inputs, outputs
-
-    def capture_step(self, controller, inputs, context, pass_index) -> wp.array[Any]:
-        controller_inputs, outputs = self._prepare_step(controller, inputs)
-        with annotate.warp_op(self.node_name):
-            controller.step(inputs=controller_inputs, outputs=outputs, dt=self.dt)
-        return outputs.joint_f
-
-    def run_native(self, values: SourceSequence) -> np.ndarray:
-        controller = self.make_controller()
-        outputs = []
-        for source_values in values:
-            inputs, result = self._prepare_step(
-                controller,
-                _warp_arrays(source_values, self.device),
-            )
-            controller.step(inputs=inputs, outputs=result, dt=self.dt)
-            wp.synchronize_device(self.device)
-            outputs.append(result.joint_f.numpy().copy())
-        return np.stack(outputs)
-
 
 class ActuatorControllerCase(ControllerExportCase):
     """Shared one-to-one input mapping for actuator controller cases."""
@@ -440,8 +486,8 @@ class PDControllerCase(ActuatorControllerCase):
         )
         return (first, middle, first)
 
-    def make_controller(self) -> ControllerPD:
-        return ControllerPD(
+    def make_controller(self) -> DrivePD:
+        return DrivePD(
             kp=wp.array([50.0, 30.0, 20.0], dtype=wp.float32, device=self.device),
             kd=wp.array([5.0, 3.0, 2.0], dtype=wp.float32, device=self.device),
             const_effort=wp.array([0.25, -0.5, 0.75], dtype=wp.float32, device=self.device),
@@ -509,8 +555,8 @@ class PIDControllerCase(ActuatorControllerCase):
         )
         return (repeated, repeated, repeated, reverse)
 
-    def make_controller(self) -> ControllerPID:
-        controller = ControllerPID(
+    def make_controller(self) -> DrivePID:
+        controller = DrivePID(
             kp=wp.array([2.0, 3.0, 4.0], dtype=wp.float32, device=self.device),
             ki=wp.array([4.0, 5.0, 6.0], dtype=wp.float32, device=self.device),
             kd=wp.array([0.5, 0.25, 0.75], dtype=wp.float32, device=self.device),
@@ -527,7 +573,7 @@ class PIDControllerCase(ActuatorControllerCase):
         }
 
     def capture_step(self, controller, inputs, context, pass_index) -> wp.array[Any]:
-        current_state = ControllerPID.State(
+        current_state = DrivePID.State(
             integral=annotate.state_tensors(
                 self.node_name,
                 {"integral": context["states"][pass_index].integral},
@@ -589,6 +635,11 @@ class TestLeappExport(unittest.TestCase):
         """Live gains, heterogeneous dynamics, and padded matrices round-trip."""
         outputs = self.assert_case_round_trip(ModelFreeJointImpedanceCase("cuda"))
         np.testing.assert_allclose(outputs[0], outputs[1], atol=ATOL)
+
+    def test_operational_space(self):
+        """Model-internal kinematics and task-space motion round-trip."""
+        outputs = self.assert_case_round_trip(OperationalSpaceCase("cuda"))
+        self.assertFalse(np.allclose(outputs[0], outputs[1], atol=ATOL))
 
     def test_pd_controller(self):
         """Stateless PD effort computation survives export."""
